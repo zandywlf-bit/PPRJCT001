@@ -26,6 +26,7 @@ YEARS: list = list(range(2024, 2036))  # 2024 – 2035 inclusive
 # ── Explicit Column Schemas ───────────────────────────────────────────
 PO_LEDGER_SCHEMA: dict = {
     'Date': 'datetime64[ns]',
+    'Expected Completion Date': 'datetime64[ns]',
     'Year': 'int64',
     'Season': 'object',
     'Factory': 'object',
@@ -88,6 +89,8 @@ def _upsert_record(df: pd.DataFrame,
 
     If a row exists where all `match_cols` equal the new record's values,
     *add* the new quantity to that existing row.  Otherwise, append a new row.
+    Metadata fields (Date, Expected Completion Date) are refreshed to the
+    latest values.
     """
     if df.empty:
         return pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
@@ -99,7 +102,12 @@ def _upsert_record(df: pd.DataFrame,
     if mask.any():
         idx = df[mask].index[0]
         df.loc[idx, quantity_col] += new_record[quantity_col]
-        df.loc[idx, 'Date'] = new_record['Date']
+        # Refresh metadata fields to latest values
+        df.loc[idx, 'Date'] = new_record.get('Date', df.loc[idx, 'Date'])
+        if 'Expected Completion Date' in new_record:
+            df.loc[idx, 'Expected Completion Date'] = new_record.get(
+                'Expected Completion Date', df.loc[idx, 'Expected Completion Date']
+            )
     else:
         df = pd.concat([df, pd.DataFrame([new_record])], ignore_index=True)
 
@@ -182,7 +190,7 @@ def delete_selected_records(ledger_name: str, indices: list) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 # Shared UI Helper — Excel Upload Section
 # ═══════════════════════════════════════════════════════════════════════
-EXPECTED_EXCEL_COLS_PO = ['Product Name', 'Product Size', 'Quantity']
+EXPECTED_EXCEL_COLS_PO = ['Product Name', 'Product Size', 'Quantity', 'Expected Completion Date']
 EXPECTED_EXCEL_COLS_PROD = ['Product Name', 'Product Size', 'Quantity Produced']
 
 
@@ -195,10 +203,17 @@ def render_excel_upload_section(page_key: str,
                                 date_key: str,
                                 year_key: str,
                                 season_key: str,
-                                factory_key: str) -> None:
+                                factory_key: str,
+                                extra_date_col: str = None,
+                                extra_date_label: str = None,
+                                extra_date_key: str = None) -> None:
     """
     Render an expandable Excel upload area.  The user selects Year, Season,
     Factory and uploads a .xlsx file.  Rows are upserted into the ledger.
+
+    If extra_date_col is provided, that column may optionally exist in the
+    uploaded Excel file.  If it does NOT exist, a date_input is shown so the
+    user can set a value applied to all rows.
     """
     with st.expander("📂 Upload via Excel File", expanded=False):
         st.markdown(
@@ -210,6 +225,16 @@ def render_excel_upload_section(page_key: str,
 
         up_date = st.date_input("Date (applied to all rows)",
                                 value=date.today(), key=date_key)
+
+        # If extra_date_col is specified and NOT a required Excel column,
+        # provide a date_input fallback
+        up_extra_date = None
+        if extra_date_col and extra_date_col not in expected_cols:
+            up_extra_date = st.date_input(
+                extra_date_label or f"{extra_date_col} (applied to all rows)",
+                value=date.today(), key=extra_date_key,
+            )
+
         up_year = st.selectbox("Year", YEARS, index=0, key=year_key)
         up_season = st.selectbox("Season", SEASONS, key=season_key)
         up_factory = st.selectbox("Factory", FACTORIES, key=factory_key)
@@ -227,8 +252,11 @@ def render_excel_upload_section(page_key: str,
                 st.error(f"Failed to read Excel file: {e}")
                 return
 
-            # Validate columns
-            missing = [c for c in expected_cols if c not in upload_df.columns]
+            # Determine which columns are truly required vs optional
+            required_cols = [c for c in expected_cols
+                             if c not in ('Expected Completion Date',)]
+            # Check required columns
+            missing = [c for c in required_cols if c not in upload_df.columns]
             if missing:
                 st.error(
                     f"Missing required columns: {', '.join(missing)}. "
@@ -261,6 +289,26 @@ def render_excel_upload_section(page_key: str,
             upload_df['Season'] = up_season
             upload_df['Factory'] = up_factory
 
+            # Handle extra date column (e.g. Expected Completion Date)
+            if extra_date_col:
+                if extra_date_col in upload_df.columns:
+                    # Try to parse from Excel; fallback to date_input value
+                    try:
+                        upload_df[extra_date_col] = pd.to_datetime(
+                            upload_df[extra_date_col], errors='coerce'
+                        )
+                        if upload_df[extra_date_col].isna().any():
+                            fill_val = pd.Timestamp(up_extra_date) if up_extra_date else pd.Timestamp(up_date)
+                            upload_df[extra_date_col] = upload_df[extra_date_col].fillna(fill_val)
+                    except Exception:
+                        upload_df[extra_date_col] = pd.Timestamp(
+                            up_extra_date if up_extra_date else up_date
+                        )
+                else:
+                    upload_df[extra_date_col] = pd.Timestamp(
+                        up_extra_date if up_extra_date else up_date
+                    )
+
             # Reorder to canonical schema
             upload_df = upload_df[list(schema.keys())]
 
@@ -291,7 +339,8 @@ def render_excel_upload_section(page_key: str,
 def render_ledger_with_delete(ledger_name: str,
                                sort_cols: list,
                                quantity_col: str,
-                               delete_warning: str) -> None:
+                               delete_warning: str,
+                               extra_date_col: str = None) -> None:
     """
     Render the ledger as an editable table with a delete checkbox column
     and an inline delete button.  Returns immediately if the ledger is empty.
@@ -306,29 +355,38 @@ def render_ledger_with_delete(ledger_name: str,
     editable = df_sorted.copy()
     editable.insert(0, 'Delete', False)
 
-    # Convert Date to string for safe editing in data_editor
-    if 'Date' in editable.columns:
-        editable['Date'] = editable['Date'].dt.strftime('%Y-%m-%d')
+    # Convert datetime columns to string for safe editing in data_editor
+    date_cols_to_str = ['Date']
+    if extra_date_col:
+        date_cols_to_str.append(extra_date_col)
+    for col in date_cols_to_str:
+        if col in editable.columns:
+            editable[col] = editable[col].dt.strftime('%Y-%m-%d')
+
+    # Build column config dynamically
+    col_config = {
+        'Delete': st.column_config.CheckboxColumn(
+            "🗑️ Delete", default=False, width="small",
+        ),
+        'Date':          st.column_config.TextColumn("Date", width="small"),
+        'Year':          st.column_config.NumberColumn("Year", width="small"),
+        'Season':        st.column_config.TextColumn("Season", width="small"),
+        'Factory':       st.column_config.TextColumn("Factory", width="small"),
+        'Product Name':  st.column_config.TextColumn("Product Name"),
+        'Product Size':  st.column_config.TextColumn("Size", width="small"),
+        'Quantity':      st.column_config.NumberColumn("Qty", width="small"),
+        'Quantity Produced': st.column_config.NumberColumn("Produced", width="small"),
+    }
+    if extra_date_col:
+        col_config[extra_date_col] = st.column_config.TextColumn(
+            extra_date_col.replace('_', ' ').title(), width="small"
+        )
 
     edited = st.data_editor(
         editable,
         use_container_width=True,
         hide_index=True,
-        column_config={
-            'Delete': st.column_config.CheckboxColumn(
-                "🗑️ Delete",
-                default=False,
-                width="small",
-            ),
-            'Date':          st.column_config.TextColumn("Date", width="small"),
-            'Year':          st.column_config.NumberColumn("Year", width="small"),
-            'Season':        st.column_config.TextColumn("Season", width="small"),
-            'Factory':       st.column_config.TextColumn("Factory", width="small"),
-            'Product Name':  st.column_config.TextColumn("Product Name"),
-            'Product Size':  st.column_config.TextColumn("Size", width="small"),
-            'Quantity':      st.column_config.NumberColumn("Qty", width="small"),
-            'Quantity Produced': st.column_config.NumberColumn("Produced", width="small"),
-        },
+        column_config=col_config,
         key=f"ledger_editor_{ledger_name}",
     )
 
@@ -342,8 +400,6 @@ def render_ledger_with_delete(ledger_name: str,
             type="secondary",
             key=f"delete_btn_{ledger_name}",
         ):
-            # Map back to original DataFrame indices before the sort
-            # We use the position-based index since we reset_index
             indices_to_drop = selected.index.tolist()
             delete_selected_records(ledger_name, indices_to_drop)
             st.toast(f"🗑️ Deleted {len(indices_to_drop)} record(s).", icon="🗑️")
@@ -402,15 +458,17 @@ def render_po_intake() -> None:
             c1, c2, c3 = st.columns(3)
             with c1:
                 po_date = st.date_input("Date", value=date.today())
+                po_exp_comp = st.date_input("Expected Completion Date",
+                                            value=date.today())
                 po_year = st.selectbox("Year", YEARS, index=0)
-                po_season = st.selectbox("Season", SEASONS)
             with c2:
+                po_season = st.selectbox("Season", SEASONS)
                 po_factory = st.selectbox("Factory", FACTORIES)
                 po_product = st.text_input("Product Name",
                                            placeholder="e.g. Widget-A")
+            with c3:
                 po_size = st.text_input("Product Size",
                                         placeholder="e.g. M or 10x20cm")
-            with c3:
                 po_qty = st.number_input("Quantity",
                                          min_value=1, step=1, value=1)
 
@@ -427,6 +485,7 @@ def render_po_intake() -> None:
                 else:
                     record = {
                         'Date': pd.Timestamp(po_date),
+                        'Expected Completion Date': pd.Timestamp(po_exp_comp),
                         'Year': po_year,
                         'Season': po_season,
                         'Factory': po_factory,
@@ -443,7 +502,8 @@ def render_po_intake() -> None:
                     )
                     st.toast(
                         f"✅ PO committed — {product_name} ({product_size})"
-                        f" ×{po_qty} → {po_factory}",
+                        f" ×{po_qty} → {po_factory}, "
+                        f"expected by {po_exp_comp}",
                         icon="✅",
                     )
 
@@ -459,6 +519,9 @@ def render_po_intake() -> None:
         year_key='up_po_year',
         season_key='up_po_season',
         factory_key='up_po_factory',
+        extra_date_col='Expected Completion Date',
+        extra_date_label='Expected Completion Date (applied to all rows if not in Excel)',
+        extra_date_key='up_po_exp_comp',
     )
 
     # ── Stateful Ledger ─────────────────────────────────────────────
@@ -474,6 +537,7 @@ def render_po_intake() -> None:
             sort_cols=['Year', 'Season', 'Factory', 'Product Name', 'Product Size'],
             quantity_col='Quantity',
             delete_warning='Click the delete button below to permanently remove these rows.',
+            extra_date_col='Expected Completion Date',
         )
 
 
@@ -650,13 +714,17 @@ def render_analytics() -> None:
         return
 
     # ── Aggregation (sum per product + size) ────────────────────────
+    # For the PO slice, also carry the latest Expected Completion Date
     GROUP_AGGS = ['Product Name', 'Product Size']
 
-    po_agg = (
-        po_slice.groupby(GROUP_AGGS, as_index=False)['Quantity'].sum()
-        if not po_slice.empty
-        else pd.DataFrame(columns=GROUP_AGGS + ['Quantity'])
-    )
+    if not po_slice.empty:
+        po_agg = po_slice.groupby(GROUP_AGGS, as_index=False).agg({
+            'Quantity': 'sum',
+            'Expected Completion Date': 'max',  # take the latest date
+        })
+    else:
+        po_agg = pd.DataFrame(columns=GROUP_AGGS + ['Quantity', 'Expected Completion Date'])
+
     pr_agg = (
         pr_slice.groupby(GROUP_AGGS, as_index=False)['Quantity Produced'].sum()
         if not pr_slice.empty
@@ -671,6 +739,7 @@ def render_analytics() -> None:
     if po_agg.empty:
         comparison = pr_agg.copy()
         comparison['Quantity'] = 0
+        comparison['Expected Completion Date'] = pd.NaT
     elif pr_agg.empty:
         comparison = po_agg.copy()
         comparison['Quantity Produced'] = 0
@@ -680,6 +749,13 @@ def render_analytics() -> None:
     comparison = comparison.fillna(0)
     comparison['Quantity'] = comparison['Quantity'].astype('int64')
     comparison['Quantity Produced'] = comparison['Quantity Produced'].astype('int64')
+
+    # Fill missing Expected Completion Date with a placeholder
+    if 'Expected Completion Date' not in comparison.columns:
+        comparison['Expected Completion Date'] = pd.NaT
+    comparison['Expected Completion Date'] = pd.to_datetime(
+        comparison['Expected Completion Date'], errors='coerce'
+    )
 
     # ── KPI: Completion Rate ────────────────────────────────────────
     def completion_rate(row):
@@ -755,16 +831,21 @@ def render_analytics() -> None:
     display['Completion Rate (%)'] = display['Completion Rate (%)'].apply(
         lambda v: f"{v:.2f}%"
     )
+    # Format Expected Completion Date as string for display
+    if 'Expected Completion Date' in display.columns:
+        display['Expected Completion Date'] = display['Expected Completion Date'].dt.strftime('%Y-%m-%d')
+
     st.dataframe(
         display,
         use_container_width=True,
         hide_index=True,
         column_config={
-            'Product Name':         st.column_config.TextColumn("Product"),
-            'Product Size':         st.column_config.TextColumn("Size"),
-            'Quantity':             st.column_config.NumberColumn("Requested"),
-            'Quantity Produced':    st.column_config.NumberColumn("Produced"),
-            'Completion Rate (%)':  st.column_config.TextColumn("Completion"),
+            'Product Name':              st.column_config.TextColumn("Product"),
+            'Product Size':              st.column_config.TextColumn("Size"),
+            'Quantity':                  st.column_config.NumberColumn("Requested"),
+            'Quantity Produced':         st.column_config.NumberColumn("Produced"),
+            'Expected Completion Date':  st.column_config.TextColumn("Expected By"),
+            'Completion Rate (%)':       st.column_config.TextColumn("Completion"),
         },
     )
 
@@ -778,7 +859,8 @@ def render_analytics() -> None:
     export['Factory'] = sel_factory
     export = export[
         ['Year', 'Season', 'Factory', 'Product Name', 'Product Size',
-         'Quantity', 'Quantity Produced', 'Completion Rate (%)']
+         'Quantity', 'Quantity Produced', 'Expected Completion Date',
+         'Completion Rate (%)']
     ]
 
     buf = BytesIO()
